@@ -7,7 +7,12 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 
-const API = (process.env.QUICKSILVER_API_BASE || 'https://api.typesafe.ai').replace(/\/$/, '');
+// Optional OpenRouter route: --route openrouter or QS_ROUTE=openrouter. Default is the vendor route.
+const argv0 = process.argv.slice(2);
+const ri = argv0.findIndex((a) => a === '--route' || a.startsWith('--route='));
+const OPENROUTER = (ri >= 0 ? (argv0[ri].split('=')[1] ?? argv0[ri + 1]) : process.env.QS_ROUTE) === 'openrouter';
+const DECIDE = OPENROUTER ? '/alpha/decisions' : '/v1/systemone';
+const API = (process.env.QUICKSILVER_API_BASE || (OPENROUTER ? 'https://openrouter.ai/api' : 'https://api.typesafe.ai')).replace(/\/$/, '');
 const HOME = process.env.QUICKSILVER_HOME || path.join(os.homedir(), '.quicksilver');
 const CONFIG = path.join(HOME, 'config.json');
 const STATS = path.join(HOME, 'stats.json');
@@ -58,10 +63,12 @@ function writeJson(file, obj, mode) {
 }
 
 function apiKey() {
+  if (OPENROUTER) return process.env.OPENROUTER_API_KEY || '';
   return process.env.JEV_API_KEY || process.env.TYPESAFE_API_KEY || readJson(CONFIG, {}).api_key || '';
 }
 
 function modelName(flags) {
+  if (OPENROUTER) return flags.model || process.env.QS_MODEL || process.env.QUICKSILVER_MODEL || 'typesafe/jev-1.13';
   return flags.model || process.env.QUICKSILVER_MODEL || readJson(CONFIG, {}).model || 'jev-latest';
 }
 
@@ -81,6 +88,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function http(method, route, body, { retries = 5 } = {}) {
   const key = apiKey();
+  if (!key && OPENROUTER) die('OPENROUTER_API_KEY is not set in the environment', 3);
   if (!key) die(`no Jev API key. Get one at ${KEY_URL}, then run: node qs.mjs setup`, 3);
   let lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -99,6 +107,7 @@ async function http(method, route, body, { retries = 5 } = {}) {
     }
     if (res.ok) return res.json();
     const text = await res.text();
+    if ((res.status === 401 || res.status === 403) && OPENROUTER) die(`OpenRouter rejected OPENROUTER_API_KEY (${res.status}). Check the key in your environment`, 3);
     if (res.status === 401 || res.status === 403) die(`Jev rejected the API key (${res.status}). Get a new one at ${KEY_URL} and run: node qs.mjs setup`, 3);
     if (res.status === 422 || res.status === 400) die(`Jev rejected the request (${res.status}): ${clip(text, 800)}`, 4);
     lastErr = `HTTP ${res.status}: ${clip(text, 300)}`;
@@ -238,7 +247,7 @@ async function runPerItem(items, flags, makeQ) {
       ? { items: Object.fromEntries(g.map((it, j) => [`i${j}`, { source: it.id, content: it.text }])) }
       : { source: g[0].id, content: g[0].text };
     const questions = Object.fromEntries(g.map((_, j) => [`q${j}`, makeQ(packed ? `\`items.i${j}\`` : '`content`', packed)]));
-    const res = await http('POST', '/v1/systemone', { model, state, questions });
+    const res = await http('POST', DECIDE, { model, state, questions });
     stats.jevTokens += res.usage?.input_tokens || 0;
     stats.model = res.model;
     return g.map((it, j) => ({ item: it, answer: res.answers[`q${j}`] }));
@@ -440,7 +449,7 @@ async function cmdFind({ pos, flags }) {
   const stats = { requests: chunks.length, jevTokens: 0 };
   const perChunk = await pool(chunks.map((c) => async () => {
     const lines = Object.fromEntries(c.lines.map(([n, t]) => [n, clip(t, 400)]));
-    const res = await http('POST', '/v1/systemone', {
+    const res = await http('POST', DECIDE, {
       model,
       state: { query, lines },
       questions: {
@@ -501,7 +510,7 @@ async function cmdAsk({ pos, flags }) {
   }
   body.model ||= modelName(flags);
   if (!body.state || !body.questions) die('spec needs "state" and "questions"');
-  const res = await http('POST', '/v1/systemone', body);
+  const res = await http('POST', DECIDE, body);
   const lines = Object.entries(res.answers).map(([id, a]) => fmtAnswer(id, a));
   const stateText = typeof body.state === 'string' ? body.state : JSON.stringify(body.state);
   const foot = footer(t0, [{ text: stateText }], [], { requests: 1, jevTokens: res.usage?.input_tokens || 0 }, lines.join('\n'), []);
@@ -531,6 +540,7 @@ async function promptHidden(q) {
 }
 
 async function cmdSetup({ pos, flags }) {
+  if (OPENROUTER) die('the openrouter route reads OPENROUTER_API_KEY from the environment and needs no setup; nothing was saved', 3);
   if (flags.remove) {
     const cfg = readJson(CONFIG, {});
     delete cfg.api_key;
@@ -550,13 +560,16 @@ async function cmdSetup({ pos, flags }) {
 }
 
 async function cmdStatus() {
-  const env = process.env.JEV_API_KEY ? 'JEV_API_KEY' : process.env.TYPESAFE_API_KEY ? 'TYPESAFE_API_KEY' : null;
+  const env = OPENROUTER ? 'OPENROUTER_API_KEY' : process.env.JEV_API_KEY ? 'JEV_API_KEY' : process.env.TYPESAFE_API_KEY ? 'TYPESAFE_API_KEY' : null;
   const key = apiKey();
+  if (!key && OPENROUTER) { console.log('not configured — OPENROUTER_API_KEY is not set in the environment'); process.exit(3); }
   if (!key) { console.log(`not configured — get a key at ${KEY_URL}, then run: node qs.mjs setup`); process.exit(3); }
-  const res = await fetch(`${API}/v1/models`, { headers: { Authorization: `Bearer ${key}` } }).catch(() => null);
+  // OpenRouter's /models answers 200 without a key, so verify against its authenticated /key endpoint instead.
+  const res = await fetch(`${API}${OPENROUTER ? '/v1/key' : '/v1/models'}`, { headers: { Authorization: `Bearer ${key}` } }).catch(() => null);
   const s = readJson(STATS, null);
   const src = env ? `env ${env}` : CONFIG;
-  if (!res) console.log(`key found (${src}) but Jev is unreachable right now`);
+  if (!res) console.log(`key found (${src}) but ${OPENROUTER ? 'OpenRouter' : 'Jev'} is unreachable right now`);
+  else if (!res.ok && OPENROUTER) { console.log(`key found (${src}) but rejected by OpenRouter (HTTP ${res.status})`); process.exit(3); }
   else if (!res.ok) { console.log(`key found (${src}) but rejected (HTTP ${res.status}) — run setup with a fresh key from ${KEY_URL}`); process.exit(3); }
   else console.log(`ready · key from ${src} · model ${modelName({})}`);
   if (s) console.log(`since ${s.since.slice(0, 10)}: ${s.runs} runs · ${fmtK(s.items)} items judged · jev ${fmtK(s.jev_input_tokens)} tok ($${(s.jev_input_tokens * PRICE_PER_TOKEN).toFixed(4)}) · ~${fmtK(s.claude_tokens_saved)} Claude tokens not read`);
@@ -577,6 +590,7 @@ inputs: files, directories (respects .gitignore), globs, - (stdin), --items FILE
 common: --lines (each line is an item) --ext ts,tsx --json --threshold 0.5 --save FILE
         --verbose (classify: one line per item) --no-collapse (lines: don't merge repeats)
         --concurrency 16 --max-chars 60000 --limit 5000 --model jev-latest
+        --route openrouter (opt in to Jev via OpenRouter; or QS_ROUTE=openrouter; key in OPENROUTER_API_KEY)
         --fast (pack small items per request: faster, less accurate)`;
 
 const COMMANDS = { setup: cmdSetup, status: cmdStatus, filter: cmdFilter, classify: cmdClassify, rank: cmdRank, find: cmdFind, ask: cmdAsk };

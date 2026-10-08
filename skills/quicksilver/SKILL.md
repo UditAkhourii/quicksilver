@@ -20,6 +20,15 @@ node "<base directory of this skill>/scripts/qs.mjs"
 
 Needs Node 18+ (globs need Node 22+). There are no other dependencies.
 
+## OpenRouter route (optional)
+
+The default route is the vendor's (`api.typesafe.ai`, key from `JEV_API_KEY`, `TYPESAFE_API_KEY` or `~/.quicksilver/config.json`). To send the same requests through OpenRouter instead, one key for several models:
+
+- Enable it per call with `--route openrouter`, or for the session with `QS_ROUTE=openrouter`.
+- The key is read by name from `OPENROUTER_API_KEY` in the environment; it is never printed or saved. `setup` refuses on this route, and `status --route openrouter` checks the key against OpenRouter.
+- The model defaults to `typesafe/jev-1.13`; override with `--model`, `QS_MODEL` or `QUICKSILVER_MODEL`.
+- The OpenRouter account must allow the `typesafe` provider in its privacy settings, otherwise the call returns 404 "No allowed providers".
+
 ## First run: set the key once
 
 Run `qs status` first.
